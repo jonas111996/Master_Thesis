@@ -269,7 +269,7 @@ X_sc <- as.matrix(X_sc)
 # and enforce group-level selection in post-processing
 # This approximates Marsilli's approach and is more robust
 
-min_train <- 4
+min_train <- 8
 Tn <- length(y_vec)
 
 sel_mat <- matrix(0L, nrow = Tn, ncol = length(var_names))
