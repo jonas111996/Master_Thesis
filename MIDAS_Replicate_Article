@@ -1,0 +1,373 @@
+## ============================================================
+## Variable selection heatmap ala Marsilli (2014) Figure 14
+## Using midasml + Table 2 dataset + Table 2 transforms
+## NOTE: PMI (NAPM) REMOVED
+## NOTE: CRB REMOVED
+## Fixes:
+##  - Robust extraction of mf$x/mf$refdate across midasml versions
+##  - Align blocks to common refdates (handles terminal date reset)
+##  - Standardize X explicitly
+##  - Force ADJACENT group memberships for sglfit() (required!)
+## ============================================================
+
+## ---- 0) Packages ----
+pkgs <- c("quantmod", "xts", "zoo", "midasml", "Matrix", "ggplot2", "tidyr", "dplyr")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install)
+lapply(pkgs, library, character.only = TRUE)
+
+options(getSymbols.warning4.0 = FALSE)
+
+## ---- 1) Helpers ----
+
+# Safe symbol download for FRED
+get_fred_xts <- function(symbol) {
+  suppressWarnings(getSymbols(symbol, src = "FRED", auto.assign = FALSE))
+}
+
+# Safe symbol download for market series (Yahoo first, then Stooq)
+get_mkt_xts <- function(symbol_yahoo, symbol_stooq = NULL) {
+  x <- tryCatch(
+    suppressWarnings(getSymbols(symbol_yahoo, src = "yahoo", auto.assign = FALSE)),
+    error = function(e) NULL
+  )
+  if (!is.null(x)) return(Cl(x))
+  if (!is.null(symbol_stooq)) {
+    x2 <- tryCatch(
+      suppressWarnings(getSymbols(symbol_stooq, src = "stooq", auto.assign = FALSE)),
+      error = function(e) NULL
+    )
+    if (!is.null(x2)) return(Cl(x2))
+  }
+  stop("Could not download: ", symbol_yahoo, " (and stooq fallback failed)")
+}
+
+# Convert xts index to Date
+as_Date_xts <- function(x) {
+  index(x) <- as.Date(index(x))
+  x
+}
+
+# Δlog (first diff of log)
+dlog <- function(x) diff(log(x))
+
+# Monthly end-of-month aggregation (level)
+to_monthly_eom <- function(x) {
+  x <- as_Date_xts(x)
+  endpoints_m <- endpoints(x, on = "months")
+  x[endpoints_m]
+}
+
+# Realized volatility proxy (rolling sd of daily log returns)
+roll_vol <- function(price, window = 22) {
+  r <- dlog(price)
+  v <- rollapply(r, width = window, FUN = sd, by = 1, align = "right", fill = NA)
+  colnames(v) <- "vol"
+  v
+}
+
+# Build MIDAS lag matrix for ONE predictor (raw mf object)
+make_mf_single <- function(refdate, x_xts, x_lag, horizon, est_start, est_end) {
+  x_xts <- as_Date_xts(x_xts)
+  data.x     <- as.numeric(coredata(x_xts))
+  data.xdate <- as.Date(index(x_xts))
+  
+  midasml::mixed_freq_data_single(
+    data.refdate = refdate,
+    data.x       = data.x,
+    data.xdate   = data.xdate,
+    x.lag        = x_lag,
+    horizon      = horizon,
+    est.start    = est_start,
+    est.end      = est_end,
+    disp.flag    = FALSE
+  )
+}
+
+# Robust extractor: find lag-matrix in mixed_freq_data_single output
+get_mf_x <- function(mf) {
+  cand <- c("x", "X", "data.x", "dataX", "xdata", "Xdata")
+  for (k in cand) if (k %in% names(mf)) return(as.matrix(mf[[k]]))
+  for (k in names(mf)) {
+    obj <- mf[[k]]
+    if (is.matrix(obj)) return(obj)
+    if (is.data.frame(obj) && ncol(obj) >= 1) return(as.matrix(obj))
+  }
+  stop("Could not find X-matrix in output from mixed_freq_data_single().")
+}
+
+# Robust extractor: find refdate in mixed_freq_data_single output
+get_mf_refdate <- function(mf) {
+  cand <- c("refdate", "data.refdate", "data_refdate", "date", "dates", "est.date", "est_dates")
+  for (k in cand) if (k %in% names(mf)) return(as.Date(mf[[k]]))
+  for (k in names(mf)) {
+    obj <- mf[[k]]
+    if (inherits(obj, "Date")) return(as.Date(obj))
+    if (is.atomic(obj) && length(obj) > 5) {
+      dd <- suppressWarnings(as.Date(obj))
+      if (!all(is.na(dd))) return(dd)
+    }
+  }
+  stop("Could not find refdate in output from mixed_freq_data_single().")
+}
+
+## ---- 2) Target: GDP growth (annualized Δlog) ----
+GDP_q <- get_fred_xts("GDPC1")
+GDP_q <- as_Date_xts(GDP_q)
+
+y_q <- 400 * dlog(GDP_q)
+colnames(y_q) <- "y"
+
+## ---- 3) Predictors (PMI removed, CRB removed) ----
+## Daily:
+SP500 <- get_mkt_xts("^GSPC")
+DJ    <- get_mkt_xts("^DJI")
+
+DGS10  <- get_fred_xts("DGS10")
+DGS3MO <- get_fred_xts("DGS3MO")
+DGS10  <- as_Date_xts(DGS10)
+DGS3MO <- as_Date_xts(DGS3MO)
+
+Spread10y3m <- DGS10 - DGS3MO
+colnames(Spread10y3m) <- "spread"
+
+## Monthly:
+AAA      <- get_fred_xts("AAA")
+BAA      <- get_fred_xts("BAA")
+AMBSL    <- get_fred_xts("AMBSL")
+BUSLOANS <- get_fred_xts("BUSLOANS")
+CPI      <- get_fred_xts("CPIAUCSL")
+CURR     <- get_fred_xts("CURRNS")
+DSPIC    <- get_fred_xts("DSPIC96")
+Housing  <- get_fred_xts("HOUST")
+IPI      <- get_fred_xts("INDPRO")
+Loans    <- get_fred_xts("LOANS")
+M2       <- get_fred_xts("M2SL")
+Oil      <- get_fred_xts("DCOILWTICO")   # daily -> monthly below
+PCE      <- get_fred_xts("PCE")
+PPI      <- get_fred_xts("PPIACO")
+TotalSL  <- get_fred_xts("TOTALSL")
+Unempl   <- get_fred_xts("UNRATE")
+
+## ---- 4) Apply transforms ----
+## Daily:
+St10y3m  <- diff(Spread10y3m)
+DJ_r     <- dlog(DJ)
+SP500_r  <- dlog(SP500)
+
+DJ_vol    <- roll_vol(DJ, window = 22)
+SP500_vol <- roll_vol(SP500, window = 22)
+
+## Monthly:
+AAA_m      <- dlog(AAA)
+BAA_m      <- dlog(BAA)
+AMBSL_m    <- dlog(AMBSL)
+BUSLOANS_m <- dlog(BUSLOANS)
+CPI_m      <- dlog(CPI)
+CURR_m     <- dlog(CURR)
+DSPIC_m    <- dlog(DSPIC)
+Housing_m  <- dlog(Housing)
+IPI_m      <- dlog(IPI)
+Loans_m    <- dlog(Loans)
+M2_m       <- dlog(M2)
+
+Oil_m_level <- to_monthly_eom(Oil)
+Oil_m       <- dlog(Oil_m_level)
+
+PCE_m      <- dlog(PCE)
+PPI_m      <- dlog(PPI)
+TotalSL_m  <- dlog(TotalSL)
+Unempl_m   <- diff(Unempl)
+
+## ---- 5) Define quarterly refdates and align target y_{t+h} ----
+q_start <- as.Date(as.yearqtr("2000 Q1"), frac = 1)
+q_end   <- as.Date(as.yearqtr("2012 Q4"), frac = 1)
+
+y_q2 <- y_q[paste0(q_start, "/", q_end)]
+ref_all <- as.Date(index(y_q2))
+y_vec_all <- as.numeric(coredata(y_q2))
+
+# h = 6 months => 2 quarters ahead (approx)
+h_months <- 6
+h_q <- 2
+
+keep <- seq_len(length(y_vec_all) - h_q)
+y_vec <- y_vec_all[keep + h_q]
+ref_q_used <- ref_all[keep]   # refdate t
+
+## ---- 6) Build ONE big X matrix from MIDAS lag blocks (ROBUST + common refdates) ----
+est_start <- q_start
+est_end   <- q_end
+
+# Daily: reduce lags to avoid killing sample; keep horizon ~6 months trading days
+xlag_d <- 130
+hor_d  <- 132
+
+# Monthly:
+xlag_m <- 12
+hor_m  <- h_months
+
+blocks <- list()
+
+make_block <- function(name, refdate, x_xts, xlag, hor, est_start, est_end) {
+  mf <- make_mf_single(refdate, x_xts, xlag, hor, est_start, est_end)
+  X  <- as.matrix(get_mf_x(mf))
+  rd <- get_mf_refdate(mf)
+  if (ncol(X) < 1) stop("Block ", name, " produced 0 columns.")
+  list(x = X, refdate = rd)
+}
+
+# Daily blocks
+blocks[["St10y3m"]]    <- make_block("St10y3m", ref_q_used, St10y3m,   xlag_d, hor_d, est_start, est_end)
+blocks[["DJ"]]         <- make_block("DJ",      ref_q_used, DJ_r,      xlag_d, hor_d, est_start, est_end)
+blocks[["SP500"]]      <- make_block("SP500",   ref_q_used, SP500_r,   xlag_d, hor_d, est_start, est_end)
+blocks[["DJvolat"]]    <- make_block("DJvolat", ref_q_used, DJ_vol,    xlag_d, hor_d, est_start, est_end)
+blocks[["SP500volat"]] <- make_block("SP500volat", ref_q_used, SP500_vol, xlag_d, hor_d, est_start, est_end)
+
+# Monthly blocks
+blocks[["AAA"]]      <- make_block("AAA",      ref_q_used, AAA_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["BAA"]]      <- make_block("BAA",      ref_q_used, BAA_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["AMBSL"]]    <- make_block("AMBSL",    ref_q_used, AMBSL_m,    xlag_m, hor_m, est_start, est_end)
+blocks[["BusLoans"]] <- make_block("BusLoans", ref_q_used, BUSLOANS_m, xlag_m, hor_m, est_start, est_end)
+blocks[["CPI"]]      <- make_block("CPI",      ref_q_used, CPI_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["Currency"]] <- make_block("Currency", ref_q_used, CURR_m,     xlag_m, hor_m, est_start, est_end)
+blocks[["DSPIC"]]    <- make_block("DSPIC",    ref_q_used, DSPIC_m,    xlag_m, hor_m, est_start, est_end)
+blocks[["Housing"]]  <- make_block("Housing",  ref_q_used, Housing_m,  xlag_m, hor_m, est_start, est_end)
+blocks[["IPI"]]      <- make_block("IPI",      ref_q_used, IPI_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["Loans"]]    <- make_block("Loans",    ref_q_used, Loans_m,    xlag_m, hor_m, est_start, est_end)
+blocks[["M2"]]       <- make_block("M2",       ref_q_used, M2_m,       xlag_m, hor_m, est_start, est_end)
+blocks[["Oil"]]      <- make_block("Oil",      ref_q_used, Oil_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["PCE"]]      <- make_block("PCE",      ref_q_used, PCE_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["PPI"]]      <- make_block("PPI",      ref_q_used, PPI_m,      xlag_m, hor_m, est_start, est_end)
+blocks[["TotalSL"]]  <- make_block("TotalSL",  ref_q_used, TotalSL_m,  xlag_m, hor_m, est_start, est_end)
+blocks[["Unempl"]]   <- make_block("Unempl",   ref_q_used, Unempl_m,   xlag_m, hor_m, est_start, est_end)
+
+var_names <- names(blocks)
+
+# Common refdates across blocks
+common_ref <- Reduce(intersect, lapply(blocks, `[[`, "refdate"))
+common_ref <- sort(common_ref)
+
+# Align y to common_ref
+y_map <- data.frame(ref = ref_q_used, y = y_vec)
+y_map <- y_map[y_map$ref %in% common_ref, , drop = FALSE]
+y_map <- y_map[match(common_ref, y_map$ref), , drop = FALSE]
+
+y_vec <- y_map$y
+ref_q_used2 <- y_map$ref
+
+# Align each block to common_ref; cbind; build group labels
+X_all <- NULL
+g_lab <- character(0)
+
+for (v in var_names) {
+  Xv <- blocks[[v]]$x
+  rd <- blocks[[v]]$refdate
+  pos <- match(common_ref, rd)
+  Xv <- Xv[pos, , drop = FALSE]
+  colnames(Xv) <- paste0(v, "_L", seq_len(ncol(Xv)))
+  
+  X_all <- cbind(X_all, Xv)
+  g_lab <- c(g_lab, rep(v, ncol(Xv)))
+}
+
+# Drop NA rows (early sample due to vol/lags)
+ok <- complete.cases(X_all) & is.finite(y_vec)
+X_all <- X_all[ok, , drop = FALSE]
+y_vec <- y_vec[ok]
+ref_q_used2 <- ref_q_used2[ok]
+
+## ---- Standardize X explicitly ----
+X_mean <- colMeans(X_all, na.rm = TRUE)
+X_sd   <- apply(X_all, 2, sd, na.rm = TRUE)
+X_sd[X_sd == 0 | is.na(X_sd)] <- 1
+X_sc <- scale(X_all, center = X_mean, scale = X_sd)
+X_sc <- as.matrix(X_sc)
+
+## ---- FIX: make ADJACENT group memberships for sglfit ----
+g_id <- as.integer(factor(g_lab, levels = var_names))
+stopifnot(!anyNA(g_id))
+
+ord <- order(g_id)
+X_sc <- X_sc[, ord, drop = FALSE]
+g_id <- g_id[ord]
+g_lab <- g_lab[ord]  # (optional) keep labels aligned
+
+## ---- 7) Expanding-window selection with midasml::sglfit (robust lambda rule) ----
+gamma <- 0.5
+min_train <- 4
+nlambda <- 80
+target_nz <- 20
+
+Tn <- length(y_vec)
+sel_mat <- matrix(0L, nrow = Tn, ncol = length(var_names))
+colnames(sel_mat) <- var_names
+rownames(sel_mat) <- as.character(zoo::as.yearqtr(ref_q_used2))
+
+group_cols <- lapply(var_names, function(v) which(g_lab == v))
+names(group_cols) <- var_names
+
+get_beta_at <- function(fit, idx) {
+  b <- fit$beta
+  if (is.null(dim(b))) stop("fit$beta has no dim; check midasml version.")
+  if (nrow(b) == ncol(X_sc)) return(b[, idx])
+  if (ncol(b) == ncol(X_sc)) return(b[idx, ])
+  stop("Unexpected beta shape in sglfit output.")
+}
+
+for (t in seq_len(Tn)) {
+  if (t < min_train) next
+  
+  X_tr <- X_sc[1:t, , drop = FALSE]
+  y_tr <- matrix(y_vec[1:t], ncol = 1)
+  
+  fit_path <- midasml::sglfit(
+    x = X_tr,
+    y = y_tr,
+    gamma = gamma,
+    nlambda = nlambda,
+    gindex = g_id,          # <-- IMPORTANT (adjacent groups)
+    intercept = TRUE
+  )
+  
+  nz <- apply(fit_path$beta, 2, function(b) sum(abs(b) > 0))
+  
+  if (all(nz == 0)) {
+    best_li <- 1
+  } else {
+    cand <- which(nz > 0)
+    best_li <- cand[which.min(abs(nz[cand] - target_nz))]
+  }
+  
+  b_best <- get_beta_at(fit_path, best_li)
+  
+  for (v in var_names) {
+    cc <- group_cols[[v]]
+    sel_mat[t, v] <- as.integer(any(abs(b_best[cc]) > 0))
+  }
+}
+
+## ---- 8) Plot heatmap ----
+sel_plot <- sel_mat
+sel_plot[is.na(sel_plot)] <- 0L
+
+df <- as.data.frame(sel_plot)
+df$ref <- rownames(sel_plot)
+
+df_long <- tidyr::pivot_longer(df, cols = all_of(var_names), names_to = "var", values_to = "sel")
+df_long$ref_yq <- zoo::as.yearqtr(df_long$ref)
+
+ggplot(df_long, aes(x = ref_yq, y = var, fill = factor(sel))) +
+  geom_tile(color = "grey80", linewidth = 0.2) +
+  scale_fill_manual(values = c("0" = "white", "1" = "darkgreen"), guide = "none") +
+  labs(
+    title = "MIDAS-ML selection (midasml::sglfit) | target: annualized GDP growth (%), h = 6 months",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10)
+  )
+
