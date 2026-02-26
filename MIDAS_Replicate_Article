@@ -1,104 +1,161 @@
 ## ============================================================
-## Variable selection heatmap ala Marsilli (2014) Figure 14
-## Using midasml + Table 2 dataset + Table 2 transforms
-## NOTE: PMI (NAPM) REMOVED
-## NOTE: CRB REMOVED
-## Fixes:
-##  - Robust extraction of mf$x/mf$refdate across midasml versions
-##  - Align blocks to common refdates (handles terminal date reset)
-##  - Standardize X explicitly
-##  - Force ADJACENT group memberships for sglfit() (required!)
+## LASSO-MIDAS (JOINT β,θ) with Nesterov-smoothed ℓ1
+##  + OCMT (One-Covariate-at-a-Time Multiple Testing) selection
+##
+## OUTPUT: TWO comparable heatmaps (same window, same styling)
+##   1) LASSO-MIDAS selection heatmap
+##   2) OCMT selection heatmap
+##
+## NOTE: PMI removed, CRB + CRBvolat removed (per your earlier choices).
+##
+## INCORPORATED FIXES:
+##   (A) lambda_max scaling fixed for SSE + λ g_mu objective:
+##       lambda_max = 2 * max_j | Z_j' (y - mean(y)) |
+##   (B) selection threshold decoupled from smoothing:
+##       sel_tol set to 1e-3 (instead of mu_smooth)
 ## ============================================================
 
 ## ---- 0) Packages ----
-pkgs <- c("quantmod", "xts", "zoo", "midasml", "Matrix", "ggplot2", "tidyr", "dplyr")
+pkgs <- c(
+  "quantmod", "xts", "zoo", "midasml", "ggplot2", "tidyr", "dplyr", "rugarch"
+)
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 if (length(to_install)) install.packages(to_install)
-lapply(pkgs, library, character.only = TRUE)
-
+invisible(lapply(pkgs, library, character.only = TRUE))
 options(getSymbols.warning4.0 = FALSE)
 
-## ---- 1) Helpers ----
+## ---- Global toggles / knobs ----
+REVERSE_LAGS <- FALSE   # if you suspect lag order mismatch, try TRUE
 
-# Safe symbol download for FRED
+## LASSO-MIDAS knobs
+mu_smooth <- 1e-1       # Nesterov smoothing parameter μ (small > 0)
+sel_tol <- 1e-3         # <-- FIX (B): interpretative selection threshold (NOT = mu)
+delta <- 0.8            # CV discount factor
+d_periods <- 4          # CV window length (quarters)
+lambda_len <- 40        # number of λ values in grid
+lambda_min_ratio <- 1e-6# smallest λ = λ_max * ratio
+
+## Optim controls
+maxit_cv <- 60          # max iterations in CV fits
+maxit_final <- 150      # max iterations in final fit
+theta1_bounds <- c(-5, 5)
+theta2_bounds <- c(-0.2, 0.05)
+
+## OCMT knobs
+ocmt_p_nominal <- 0.05     # p in cp(n,delta)
+ocmt_c_mult    <- 1.0      # c in f(n,delta)=c*n^delta
+ocmt_delta1    <- 1.10     # stage-1 delta (>1)
+ocmt_delta2    <- 2.10     # later-stage delta* (>2)
+ocmt_lmax_frac <- 0.50     # cap selected regressors at floor(T_train * frac)
+ocmt_max_stages <- 50      # safety cap
+
+
+## ============================================================
+## 1) Helpers
+## ============================================================
 get_fred_xts <- function(symbol) {
   suppressWarnings(getSymbols(symbol, src = "FRED", auto.assign = FALSE))
 }
 
-# Safe symbol download for market series (Yahoo first, then Stooq)
-get_mkt_xts <- function(symbol_yahoo, symbol_stooq = NULL) {
+get_mkt_xts <- function(symbol_yahoo, symbol_stooq = NULL, from = "1999-01-01") {
   x <- tryCatch(
-    suppressWarnings(getSymbols(symbol_yahoo, src = "yahoo", auto.assign = FALSE)),
+    suppressWarnings(getSymbols(symbol_yahoo, src = "yahoo", from = from, auto.assign = FALSE)),
     error = function(e) NULL
   )
   if (!is.null(x)) return(Cl(x))
+  
   if (!is.null(symbol_stooq)) {
     x2 <- tryCatch(
-      suppressWarnings(getSymbols(symbol_stooq, src = "stooq", auto.assign = FALSE)),
+      suppressWarnings(getSymbols(symbol_stooq, src = "stooq", from = from, auto.assign = FALSE)),
       error = function(e) NULL
     )
     if (!is.null(x2)) return(Cl(x2))
   }
-  stop("Could not download: ", symbol_yahoo, " (and stooq fallback failed)")
+  stop("Could not download: ", symbol_yahoo)
 }
 
-# Convert xts index to Date
-as_Date_xts <- function(x) {
-  index(x) <- as.Date(index(x))
-  x
-}
-
-# Δlog (first diff of log)
+as_Date_xts <- function(x) { index(x) <- as.Date(index(x)); x }
 dlog <- function(x) diff(log(x))
 
-# Monthly end-of-month aggregation (level)
 to_monthly_eom <- function(x) {
   x <- as_Date_xts(x)
-  endpoints_m <- endpoints(x, on = "months")
-  x[endpoints_m]
+  ep <- endpoints(x, on = "months")
+  ep <- ep[ep > 0]
+  x[ep]
 }
 
-# Realized volatility proxy (rolling sd of daily log returns)
-roll_vol <- function(price, window = 22) {
-  r <- dlog(price)
-  v <- rollapply(r, width = window, FUN = sd, by = 1, align = "right", fill = NA)
+winsorize_vec <- function(z, p = 0.01) {
+  z <- as.numeric(z)
+  ql <- stats::quantile(z, probs = p, na.rm = TRUE, type = 8)
+  qh <- stats::quantile(z, probs = 1 - p, na.rm = TRUE, type = 8)
+  z[z < ql] <- ql
+  z[z > qh] <- qh
+  z
+}
+
+whiten_and_winsorize_returns <- function(r_xts, p = 0.01) {
+  r <- as.numeric(coredata(r_xts))
+  ok <- is.finite(r)
+  r2 <- r
+  r2[ok] <- winsorize_vec(r2[ok], p = p)
+  mu <- mean(r2[ok], na.rm = TRUE)
+  sdv <- stats::sd(r2[ok], na.rm = TRUE)
+  if (!is.finite(sdv) || sdv == 0) sdv <- 1
+  r2[ok] <- (r2[ok] - mu) / sdv
+  out <- r_xts
+  out[] <- r2
+  out
+}
+
+garch_vol_daily <- function(ret_xts) {
+  ret_xts <- as_Date_xts(ret_xts)
+  r <- as.numeric(coredata(ret_xts))
+  idx <- index(ret_xts)
+  ok <- is.finite(r)
+  r_ok <- r[ok]
+  idx_ok <- idx[ok]
+  if (length(r_ok) < 200) stop("Not enough data for GARCH fit.")
+  
+  spec <- rugarch::ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = "norm"
+  )
+  fit <- rugarch::ugarchfit(spec = spec, data = r_ok, solver = "hybrid",
+                            fit.control = list(scale = 1))
+  sig <- as.numeric(rugarch::sigma(fit))
+  v <- xts::xts(sig, order.by = as.Date(idx_ok))
   colnames(v) <- "vol"
   v
 }
 
-# Build MIDAS lag matrix for ONE predictor (raw mf object)
 make_mf_single <- function(refdate, x_xts, x_lag, horizon, est_start, est_end) {
   x_xts <- as_Date_xts(x_xts)
-  data.x     <- as.numeric(coredata(x_xts))
-  data.xdate <- as.Date(index(x_xts))
-  
   midasml::mixed_freq_data_single(
     data.refdate = refdate,
-    data.x       = data.x,
-    data.xdate   = data.xdate,
-    x.lag        = x_lag,
-    horizon      = horizon,
-    est.start    = est_start,
-    est.end      = est_end,
-    disp.flag    = FALSE
+    data.x = as.numeric(coredata(x_xts)),
+    data.xdate = as.Date(index(x_xts)),
+    x.lag = x_lag,
+    horizon = horizon,
+    est.start = est_start,
+    est.end = est_end,
+    disp.flag = FALSE
   )
 }
 
-# Robust extractor: find lag-matrix in mixed_freq_data_single output
 get_mf_x <- function(mf) {
-  cand <- c("x", "X", "data.x", "dataX", "xdata", "Xdata")
+  cand <- c("x","X","data.x","dataX","xdata","Xdata")
   for (k in cand) if (k %in% names(mf)) return(as.matrix(mf[[k]]))
   for (k in names(mf)) {
     obj <- mf[[k]]
     if (is.matrix(obj)) return(obj)
     if (is.data.frame(obj) && ncol(obj) >= 1) return(as.matrix(obj))
   }
-  stop("Could not find X-matrix in output from mixed_freq_data_single().")
+  stop("Could not find X-matrix in mixed_freq_data_single output.")
 }
 
-# Robust extractor: find refdate in mixed_freq_data_single output
 get_mf_refdate <- function(mf) {
-  cand <- c("refdate", "data.refdate", "data_refdate", "date", "dates", "est.date", "est_dates")
+  cand <- c("refdate","data.refdate","data_refdate","date","dates","est.date","est_dates")
   for (k in cand) if (k %in% names(mf)) return(as.Date(mf[[k]]))
   for (k in names(mf)) {
     obj <- mf[[k]]
@@ -108,266 +165,1036 @@ get_mf_refdate <- function(mf) {
       if (!all(is.na(dd))) return(dd)
     }
   }
-  stop("Could not find refdate in output from mixed_freq_data_single().")
+  stop("Could not find refdate in mixed_freq_data_single output.")
 }
 
-## ---- 2) Target: GDP growth (annualized Δlog) ----
-GDP_q <- get_fred_xts("GDPC1")
-GDP_q <- as_Date_xts(GDP_q)
+fmt_yq <- function(d) format(zoo::as.yearqtr(d), "%Yq%q")
 
+## ============================================================
+## 2) Exponential Almon kernel + derivatives w.r.t θ  (multivariate)
+## ============================================================
+compute_Z_and_dZ <- function(Xlag_list_train, theta_mat) {
+  p <- length(Xlag_list_train)
+  Tt <- nrow(Xlag_list_train[[1]])
+  Z <- matrix(NA_real_, Tt, p)
+  dZ1 <- matrix(NA_real_, Tt, p)
+  dZ2 <- matrix(NA_real_, Tt, p)
+  
+  for (j in seq_len(p)) {
+    Xj <- Xlag_list_train[[j]]  # T x K
+    K <- ncol(Xj)
+    k <- seq_len(K)
+    k2 <- k^2
+    th1 <- theta_mat[j, 1]
+    th2 <- theta_mat[j, 2]
+    
+    u <- th1 * k + th2 * k2
+    u <- u - max(u) # stability
+    ew <- exp(u)
+    w <- ew / sum(ew)
+    
+    Ek <- sum(w * k)
+    Ek2 <- sum(w * k2)
+    
+    z <- as.numeric(Xj %*% w)
+    xk <- as.numeric(Xj %*% (w * k))
+    xk2 <- as.numeric(Xj %*% (w * k2))
+    
+    dz1 <- xk - Ek * z
+    dz2 <- xk2 - Ek2 * z
+    
+    Z[, j] <- z
+    dZ1[, j] <- dz1
+    dZ2[, j] <- dz2
+  }
+  list(Z = Z, dZ1 = dZ1, dZ2 = dZ2)
+}
+
+## ============================================================
+## 3) Nesterov local regularization g_μ(β) and gradient
+## ============================================================
+g_mu <- function(beta, mu) {
+  a <- abs(beta)
+  out <- ifelse(a <= mu, (beta^2) / (2 * mu), a - mu / 2)
+  sum(out)
+}
+
+grad_g_mu <- function(beta, mu) {
+  a <- abs(beta)
+  g <- numeric(length(beta))
+  g[a > mu] <- sign(beta[a > mu])
+  g[a <= mu] <- beta[a <= mu] / mu
+  g
+}
+
+## ============================================================
+## 4) Joint (β,θ) solver for fixed λ using smooth optimization (L-BFGS-B)
+## ============================================================
+joint_fit_nesterov <- function(Xlag_list_train, y_train, lambda, theta_init,
+                               beta_init = NULL, alpha_init = NULL,
+                               mu = 1e-4, maxit = 100) {
+  p <- length(Xlag_list_train)
+  vnames <- names(Xlag_list_train)
+  
+  if (is.null(theta_init)) {
+    theta_init <- cbind(rep(-0.05, p), rep(-0.0001, p))
+    rownames(theta_init) <- vnames
+  }
+  if (is.null(beta_init)) beta_init <- rep(0, p)
+  if (is.null(alpha_init)) alpha_init <- mean(y_train)
+  
+  pack <- function(alpha, beta, theta) c(alpha, beta, theta[,1], theta[,2])
+  unpack <- function(par) {
+    alpha <- par[1]
+    beta <- par[2:(1+p)]
+    th1 <- par[(2+p):(1+2*p)]
+    th2 <- par[(2+2*p):(1+3*p)]
+    theta <- cbind(th1, th2)
+    rownames(theta) <- vnames
+    list(alpha = alpha, beta = beta, theta = theta)
+  }
+  
+  par0 <- pack(alpha_init, beta_init, theta_init)
+  lower <- c(-Inf, rep(-Inf, p), rep(theta1_bounds[1], p), rep(theta2_bounds[1], p))
+  upper <- c( Inf, rep( Inf, p), rep(theta1_bounds[2], p), rep(theta2_bounds[2], p))
+  
+  fn_gr <- function(par) {
+    u <- unpack(par)
+    alpha <- u$alpha
+    beta <- u$beta
+    theta <- u$theta
+    
+    Zd <- compute_Z_and_dZ(Xlag_list_train, theta)
+    Z <- Zd$Z
+    dZ1 <- Zd$dZ1
+    dZ2 <- Zd$dZ2
+    
+    pred <- as.numeric(alpha + Z %*% beta)
+    res <- y_train - pred
+    
+    sse <- sum(res^2)
+    pen <- lambda * g_mu(beta, mu)
+    val <- sse + pen
+    
+    g_alpha <- -2 * sum(res)
+    g_beta_sse <- -2 * drop(crossprod(Z, res))
+    g_beta_pen <- lambda * grad_g_mu(beta, mu)
+    g_beta <- g_beta_sse + g_beta_pen
+    
+    g_th1 <- numeric(p)
+    g_th2 <- numeric(p)
+    for (j in seq_len(p)) {
+      bj <- beta[j]
+      if (!is.finite(bj) || bj == 0) next
+      g_th1[j] <- -2 * bj * sum(res * dZ1[, j])
+      g_th2[j] <- -2 * bj * sum(res * dZ2[, j])
+    }
+    
+    gr <- c(g_alpha, g_beta, g_th1, g_th2)
+    list(value = val, gradient = gr)
+  }
+  
+  opt <- tryCatch(
+    optim(
+      par = par0,
+      fn = function(par) fn_gr(par)$value,
+      gr = function(par) fn_gr(par)$gradient,
+      method = "L-BFGS-B",
+      lower = lower, upper = upper,
+      control = list(maxit = maxit)
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(opt) || any(!is.finite(opt$par))) return(NULL)
+  
+  uu <- unpack(opt$par)
+  list(alpha = uu$alpha, beta = uu$beta, theta = uu$theta,
+       value = opt$value, convergence = opt$convergence)
+}
+
+predict_row <- function(Xlag_list_full, row_idx, theta_mat, alpha, beta) {
+  p <- length(Xlag_list_full)
+  z <- numeric(p)
+  for (j in seq_len(p)) {
+    xrow <- Xlag_list_full[[j]][row_idx, ]
+    K <- length(xrow)
+    k <- seq_len(K)
+    k2 <- k^2
+    th1 <- theta_mat[j,1]
+    th2 <- theta_mat[j,2]
+    u <- th1*k + th2*k2
+    u <- u - max(u)
+    w <- exp(u); w <- w/sum(w)
+    z[j] <- sum(xrow * w)
+  }
+  alpha + sum(z * beta)
+}
+
+## ============================================================
+## 5) Target: GDP growth (annualized Δlog), quarterly
+## ============================================================
+GDP_q <- as_Date_xts(get_fred_xts("GDPC1"))
 y_q <- 400 * dlog(GDP_q)
 colnames(y_q) <- "y"
 
-## ---- 3) Predictors (PMI removed, CRB removed) ----
-## Daily:
-SP500 <- get_mkt_xts("^GSPC")
-DJ    <- get_mkt_xts("^DJI")
+q_start_data <- as.Date(as.yearqtr("1964 Q3"), frac = 1)
+q_end <- as.Date(as.yearqtr("2012 Q4"), frac = 1)
+y_q2 <- y_q[paste0(q_start_data, "/", q_end)]
 
-DGS10  <- get_fred_xts("DGS10")
-DGS3MO <- get_fred_xts("DGS3MO")
-DGS10  <- as_Date_xts(DGS10)
-DGS3MO <- as_Date_xts(DGS3MO)
-
-Spread10y3m <- DGS10 - DGS3MO
-colnames(Spread10y3m) <- "spread"
-
-## Monthly:
-AAA      <- get_fred_xts("AAA")
-BAA      <- get_fred_xts("BAA")
-AMBSL    <- get_fred_xts("AMBSL")
-BUSLOANS <- get_fred_xts("BUSLOANS")
-CPI      <- get_fred_xts("CPIAUCSL")
-CURR     <- get_fred_xts("CURRNS")
-DSPIC    <- get_fred_xts("DSPIC96")
-Housing  <- get_fred_xts("HOUST")
-IPI      <- get_fred_xts("INDPRO")
-Loans    <- get_fred_xts("LOANS")
-M2       <- get_fred_xts("M2SL")
-Oil      <- get_fred_xts("DCOILWTICO")   # daily -> monthly below
-PCE      <- get_fred_xts("PCE")
-PPI      <- get_fred_xts("PPIACO")
-TotalSL  <- get_fred_xts("TOTALSL")
-Unempl   <- get_fred_xts("UNRATE")
-
-## ---- 4) Apply transforms ----
-## Daily:
-St10y3m  <- diff(Spread10y3m)
-DJ_r     <- dlog(DJ)
-SP500_r  <- dlog(SP500)
-
-DJ_vol    <- roll_vol(DJ, window = 22)
-SP500_vol <- roll_vol(SP500, window = 22)
-
-## Monthly:
-AAA_m      <- dlog(AAA)
-BAA_m      <- dlog(BAA)
-AMBSL_m    <- dlog(AMBSL)
-BUSLOANS_m <- dlog(BUSLOANS)
-CPI_m      <- dlog(CPI)
-CURR_m     <- dlog(CURR)
-DSPIC_m    <- dlog(DSPIC)
-Housing_m  <- dlog(Housing)
-IPI_m      <- dlog(IPI)
-Loans_m    <- dlog(Loans)
-M2_m       <- dlog(M2)
-
-Oil_m_level <- to_monthly_eom(Oil)
-Oil_m       <- dlog(Oil_m_level)
-
-PCE_m      <- dlog(PCE)
-PPI_m      <- dlog(PPI)
-TotalSL_m  <- dlog(TotalSL)
-Unempl_m   <- diff(Unempl)
-
-## ---- 5) Define quarterly refdates and align target y_{t+h} ----
-q_start <- as.Date(as.yearqtr("2000 Q1"), frac = 1)
-q_end   <- as.Date(as.yearqtr("2012 Q4"), frac = 1)
-
-y_q2 <- y_q[paste0(q_start, "/", q_end)]
 ref_all <- as.Date(index(y_q2))
-y_vec_all <- as.numeric(coredata(y_q2))
+y_all <- as.numeric(coredata(y_q2))
 
-# h = 6 months => 2 quarters ahead (approx)
 h_months <- 6
 h_q <- 2
 
-keep <- seq_len(length(y_vec_all) - h_q)
-y_vec <- y_vec_all[keep + h_q]
-ref_q_used <- ref_all[keep]   # refdate t
+origin_ref <- ref_all[1:(length(ref_all) - h_q)]
+target_ref <- ref_all[(1 + h_q):length(ref_all)]
+y_lead <- y_all[(1 + h_q):length(y_all)]  # y_{t+h}
 
-## ---- 6) Build ONE big X matrix from MIDAS lag blocks (ROBUST + common refdates) ----
-est_start <- q_start
-est_end   <- q_end
+## ============================================================
+## 6) Predictors (CRB + PMI removed)
+## ============================================================
+from_daily <- "1960-01-01"
+SP500 <- get_mkt_xts("^GSPC", from = from_daily)
+DJ <- get_mkt_xts("^DJI", from = from_daily)
 
-# Daily: reduce lags to avoid killing sample; keep horizon ~6 months trading days
+DGS10 <- as_Date_xts(get_fred_xts("DGS10"))
+DGS3MO <- as_Date_xts(get_fred_xts("DGS3MO"))
+Spread10y3m <- DGS10 - DGS3MO
+colnames(Spread10y3m) <- "spread"
+
+AAA <- get_fred_xts("AAA")
+BAA <- get_fred_xts("BAA")
+AMBSL <- get_fred_xts("AMBSL")
+BUSLOANS <- get_fred_xts("BUSLOANS")
+CPI <- get_fred_xts("CPIAUCSL")
+CURR <- get_fred_xts("CURRNS")
+DSPIC <- get_fred_xts("DSPIC96")
+Housing <- get_fred_xts("HOUST")
+IPI <- get_fred_xts("INDPRO")
+Loans <- get_fred_xts("LOANS")
+M2 <- get_fred_xts("M2SL")
+Oil <- get_fred_xts("DCOILWTICO")
+PCE <- get_fred_xts("PCE")
+PPI <- get_fred_xts("PPIACO")
+TotalSL <- get_fred_xts("TOTALSL")
+Unempl <- get_fred_xts("UNRATE")
+
+## ============================================================
+## 7) Apply transforms
+## ============================================================
+St10y3m <- diff(Spread10y3m)
+
+DJ_r <- dlog(DJ)
+SP500_r <- dlog(SP500)
+
+DJ_r_ww <- whiten_and_winsorize_returns(DJ_r, p = 0.01)
+SP500_r_ww <- whiten_and_winsorize_returns(SP500_r, p = 0.01)
+
+DJ_volat <- garch_vol_daily(DJ_r_ww)
+SP500_volat <- garch_vol_daily(SP500_r_ww)
+
+AAA_m <- dlog(AAA)
+BAA_m <- dlog(BAA)
+AMBSL_m <- dlog(AMBSL)
+BUSLOANS_m <- dlog(BUSLOANS)
+CPI_m <- dlog(CPI)
+CURR_m <- dlog(CURR)
+DSPIC_m <- dlog(DSPIC)
+Housing_m <- dlog(Housing)
+IPI_m <- dlog(IPI)
+Loans_m <- dlog(Loans)
+M2_m <- dlog(M2)
+
+Oil_m_level <- to_monthly_eom(Oil)
+Oil_m <- dlog(Oil_m_level)
+
+PCE_m <- dlog(PCE)
+PPI_m <- dlog(PPI)
+TotalSL_m <- dlog(TotalSL)
+Unempl_m <- diff(Unempl)
+
+## ============================================================
+## 8) Build MIDAS lag matrices (raw lags)
+## IMPORTANT: horizon = 0 (direct multi-step uses y_{t+h})
+## ============================================================
+est_start <- q_start_data
+est_end <- q_end
+
 xlag_d <- 130
-hor_d  <- 132
-
-# Monthly:
 xlag_m <- 12
-hor_m  <- h_months
-
-blocks <- list()
+hor_d <- 0
+hor_m <- 0
 
 make_block <- function(name, refdate, x_xts, xlag, hor, est_start, est_end) {
   mf <- make_mf_single(refdate, x_xts, xlag, hor, est_start, est_end)
-  X  <- as.matrix(get_mf_x(mf))
+  X <- as.matrix(get_mf_x(mf))
+  if (REVERSE_LAGS) X <- X[, ncol(X):1, drop = FALSE]
   rd <- get_mf_refdate(mf)
-  if (ncol(X) < 1) stop("Block ", name, " produced 0 columns.")
   list(x = X, refdate = rd)
 }
 
-# Daily blocks
-blocks[["St10y3m"]]    <- make_block("St10y3m", ref_q_used, St10y3m,   xlag_d, hor_d, est_start, est_end)
-blocks[["DJ"]]         <- make_block("DJ",      ref_q_used, DJ_r,      xlag_d, hor_d, est_start, est_end)
-blocks[["SP500"]]      <- make_block("SP500",   ref_q_used, SP500_r,   xlag_d, hor_d, est_start, est_end)
-blocks[["DJvolat"]]    <- make_block("DJvolat", ref_q_used, DJ_vol,    xlag_d, hor_d, est_start, est_end)
-blocks[["SP500volat"]] <- make_block("SP500volat", ref_q_used, SP500_vol, xlag_d, hor_d, est_start, est_end)
+blocks <- list()
 
-# Monthly blocks
-blocks[["AAA"]]      <- make_block("AAA",      ref_q_used, AAA_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["BAA"]]      <- make_block("BAA",      ref_q_used, BAA_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["AMBSL"]]    <- make_block("AMBSL",    ref_q_used, AMBSL_m,    xlag_m, hor_m, est_start, est_end)
-blocks[["BusLoans"]] <- make_block("BusLoans", ref_q_used, BUSLOANS_m, xlag_m, hor_m, est_start, est_end)
-blocks[["CPI"]]      <- make_block("CPI",      ref_q_used, CPI_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["Currency"]] <- make_block("Currency", ref_q_used, CURR_m,     xlag_m, hor_m, est_start, est_end)
-blocks[["DSPIC"]]    <- make_block("DSPIC",    ref_q_used, DSPIC_m,    xlag_m, hor_m, est_start, est_end)
-blocks[["Housing"]]  <- make_block("Housing",  ref_q_used, Housing_m,  xlag_m, hor_m, est_start, est_end)
-blocks[["IPI"]]      <- make_block("IPI",      ref_q_used, IPI_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["Loans"]]    <- make_block("Loans",    ref_q_used, Loans_m,    xlag_m, hor_m, est_start, est_end)
-blocks[["M2"]]       <- make_block("M2",       ref_q_used, M2_m,       xlag_m, hor_m, est_start, est_end)
-blocks[["Oil"]]      <- make_block("Oil",      ref_q_used, Oil_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["PCE"]]      <- make_block("PCE",      ref_q_used, PCE_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["PPI"]]      <- make_block("PPI",      ref_q_used, PPI_m,      xlag_m, hor_m, est_start, est_end)
-blocks[["TotalSL"]]  <- make_block("TotalSL",  ref_q_used, TotalSL_m,  xlag_m, hor_m, est_start, est_end)
-blocks[["Unempl"]]   <- make_block("Unempl",   ref_q_used, Unempl_m,   xlag_m, hor_m, est_start, est_end)
+## Daily blocks
+blocks[["St10y3m"]] <- make_block("St10y3m", origin_ref, St10y3m, xlag_d, hor_d, est_start, est_end)
+blocks[["DJ"]] <- make_block("DJ", origin_ref, DJ_r, xlag_d, hor_d, est_start, est_end)
+blocks[["SP500"]] <- make_block("SP500", origin_ref, SP500_r, xlag_d, hor_d, est_start, est_end)
+blocks[["DJvolat"]] <- make_block("DJvolat", origin_ref, DJ_volat, xlag_d, hor_d, est_start, est_end)
+blocks[["SP500volat"]] <- make_block("SP500volat", origin_ref, SP500_volat, xlag_d, hor_d, est_start, est_end)
+
+## Monthly blocks
+blocks[["AAA"]] <- make_block("AAA", origin_ref, AAA_m, xlag_m, hor_m, est_start, est_end)
+blocks[["AMBSL"]] <- make_block("AMBSL", origin_ref, AMBSL_m, xlag_m, hor_m, est_start, est_end)
+blocks[["BAA"]] <- make_block("BAA", origin_ref, BAA_m, xlag_m, hor_m, est_start, est_end)
+blocks[["BusLoans"]] <- make_block("BusLoans", origin_ref, BUSLOANS_m, xlag_m, hor_m, est_start, est_end)
+blocks[["CPI"]] <- make_block("CPI", origin_ref, CPI_m, xlag_m, hor_m, est_start, est_end)
+blocks[["Currency"]] <- make_block("Currency", origin_ref, CURR_m, xlag_m, hor_m, est_start, est_end)
+blocks[["DSPIC"]] <- make_block("DSPIC", origin_ref, DSPIC_m, xlag_m, hor_m, est_start, est_end)
+blocks[["Housing"]] <- make_block("Housing", origin_ref, Housing_m, xlag_m, hor_m, est_start, est_end)
+blocks[["IPI"]] <- make_block("IPI", origin_ref, IPI_m, xlag_m, hor_m, est_start, est_end)
+blocks[["Loans"]] <- make_block("Loans", origin_ref, Loans_m, xlag_m, hor_m, est_start, est_end)
+blocks[["M2"]] <- make_block("M2", origin_ref, M2_m, xlag_m, hor_m, est_start, est_end)
+blocks[["Oil"]] <- make_block("Oil", origin_ref, Oil_m, xlag_m, hor_m, est_start, est_end)
+blocks[["PCE"]] <- make_block("PCE", origin_ref, PCE_m, xlag_m, hor_m, est_start, est_end)
+blocks[["PPI"]] <- make_block("PPI", origin_ref, PPI_m, xlag_m, hor_m, est_start, est_end)
+blocks[["TotalSL"]] <- make_block("TotalSL", origin_ref, TotalSL_m, xlag_m, hor_m, est_start, est_end)
+blocks[["Unempl"]] <- make_block("Unempl", origin_ref, Unempl_m, xlag_m, hor_m, est_start, est_end)
 
 var_names <- names(blocks)
+p <- length(var_names)
 
-# Common refdates across blocks
-common_ref <- Reduce(intersect, lapply(blocks, `[[`, "refdate"))
+## ---- Align on common origin refdates ----
+common_ref <- Reduce(intersect, lapply(blocks, function(b) b$refdate))
 common_ref <- sort(common_ref)
 
-# Align y to common_ref
-y_map <- data.frame(ref = ref_q_used, y = y_vec)
-y_map <- y_map[y_map$ref %in% common_ref, , drop = FALSE]
-y_map <- y_map[match(common_ref, y_map$ref), , drop = FALSE]
+y_map <- data.frame(origin = origin_ref, target = target_ref, y = y_lead)
+y_map <- y_map[y_map$origin %in% common_ref, , drop = FALSE]
+y_map <- y_map[match(common_ref, y_map$origin), , drop = FALSE]
 
 y_vec <- y_map$y
-ref_q_used2 <- y_map$ref
+origin_ref2 <- y_map$origin
+target_ref2 <- y_map$target
 
-# Align each block to common_ref; cbind; build group labels
-X_all <- NULL
-g_lab <- character(0)
-
+Xlag_list <- list()
 for (v in var_names) {
-  Xv <- blocks[[v]]$x
-  rd <- blocks[[v]]$refdate
-  pos <- match(common_ref, rd)
-  Xv <- Xv[pos, , drop = FALSE]
-  colnames(Xv) <- paste0(v, "_L", seq_len(ncol(Xv)))
-  
-  X_all <- cbind(X_all, Xv)
-  g_lab <- c(g_lab, rep(v, ncol(Xv)))
+  pos <- match(common_ref, blocks[[v]]$refdate)
+  Xlag_list[[v]] <- blocks[[v]]$x[pos, , drop = FALSE]
 }
+names(Xlag_list) <- var_names
 
-# Drop NA rows (early sample due to vol/lags)
-ok <- complete.cases(X_all) & is.finite(y_vec)
-X_all <- X_all[ok, , drop = FALSE]
-y_vec <- y_vec[ok]
-ref_q_used2 <- ref_q_used2[ok]
-
-## ---- Standardize X explicitly ----
-X_mean <- colMeans(X_all, na.rm = TRUE)
-X_sd   <- apply(X_all, 2, sd, na.rm = TRUE)
-X_sd[X_sd == 0 | is.na(X_sd)] <- 1
-X_sc <- scale(X_all, center = X_mean, scale = X_sd)
-X_sc <- as.matrix(X_sc)
-
-## ---- FIX: make ADJACENT group memberships for sglfit ----
-g_id <- as.integer(factor(g_lab, levels = var_names))
-stopifnot(!anyNA(g_id))
-
-ord <- order(g_id)
-X_sc <- X_sc[, ord, drop = FALSE]
-g_id <- g_id[ord]
-g_lab <- g_lab[ord]  # (optional) keep labels aligned
-
-## ---- 7) Expanding-window selection with midasml::sglfit (robust lambda rule) ----
-gamma <- 0.5
-min_train <- 4
-nlambda <- 80
-target_nz <- 20
-
+## Drop rows with any NA
+all_ok <- is.finite(y_vec)
+for (v in var_names) all_ok <- all_ok & complete.cases(Xlag_list[[v]])
+y_vec <- y_vec[all_ok]
+origin_ref2 <- origin_ref2[all_ok]
+target_ref2 <- target_ref2[all_ok]
+for (v in var_names) Xlag_list[[v]] <- Xlag_list[[v]][all_ok, , drop = FALSE]
 Tn <- length(y_vec)
-sel_mat <- matrix(0L, nrow = Tn, ncol = length(var_names))
-colnames(sel_mat) <- var_names
-rownames(sel_mat) <- as.character(zoo::as.yearqtr(ref_q_used2))
 
-group_cols <- lapply(var_names, function(v) which(g_lab == v))
-names(group_cols) <- var_names
+## Common plotting window
+plot_start_date <- as.Date(zoo::as.yearqtr("2000 Q1"), frac = 1)
+plot_end_date   <- as.Date(zoo::as.yearqtr("2012 Q4"), frac = 1)
 
-get_beta_at <- function(fit, idx) {
-  b <- fit$beta
-  if (is.null(dim(b))) stop("fit$beta has no dim; check midasml version.")
-  if (nrow(b) == ncol(X_sc)) return(b[, idx])
-  if (ncol(b) == ncol(X_sc)) return(b[idx, ])
-  stop("Unexpected beta shape in sglfit output.")
-}
+q_start_selection_target <- as.Date(as.yearqtr("2000 Q1"), frac = 1)
+selection_start_idx <- which(target_ref2 >= q_start_selection_target)[1]
 
-for (t in seq_len(Tn)) {
-  if (t < min_train) next
+## ============================================================
+## 9A) LASSO-MIDAS selection loop (discounted pseudo-OOS CV)
+## ============================================================
+sel_mat_lasso <- matrix(NA_integer_, nrow = Tn, ncol = p)
+colnames(sel_mat_lasso) <- var_names
+rownames(sel_mat_lasso) <- as.character(zoo::as.yearqtr(target_ref2))
+
+theta_warm <- cbind(rep(-0.05, p), rep(-0.0001, p))
+rownames(theta_warm) <- var_names
+beta_warm <- rep(0, p)
+alpha_warm <- 0
+
+cat("\n=== LASSO-MIDAS (JOINT) with Nesterov smoothing (mu =", mu_smooth, ") ===\n")
+cat("Selection shown (targets):", fmt_yq(q_start_selection_target), "to", fmt_yq(max(target_ref2)), "\n")
+cat("h =", h_months, "months | horizon=0 blocks | delta =", delta, " d =", d_periods, "\n\n")
+
+for (i in seq_len(Tn)) {
+  if (is.na(selection_start_idx) || i < selection_start_idx) next
   
-  X_tr <- X_sc[1:t, , drop = FALSE]
-  y_tr <- matrix(y_vec[1:t], ncol = 1)
+  train_end_main <- max(which(target_ref2 <= origin_ref2[i]))
+  if (!is.finite(train_end_main) || train_end_main < 20) next
   
-  fit_path <- midasml::sglfit(
-    x = X_tr,
-    y = y_tr,
-    gamma = gamma,
-    nlambda = nlambda,
-    gindex = g_id,          # <-- IMPORTANT (adjacent groups)
-    intercept = TRUE
+  Xtrain_main <- lapply(Xlag_list, function(M) M[1:train_end_main, , drop = FALSE])
+  ytrain_main <- y_vec[1:train_end_main]
+  
+  ## lambda grid using warm theta
+  Zd_warm <- compute_Z_and_dZ(Xtrain_main, theta_warm)
+  Zwarm <- Zd_warm$Z
+  yw <- ytrain_main - mean(ytrain_main)
+  
+  ## ---- FIX (A): correct lambda_max scaling for SSE + λ g_mu ----
+  lambda_max <- 2 * max(abs(drop(crossprod(Zwarm, yw))))
+  if (!is.finite(lambda_max) || lambda_max <= 0) next
+  
+  lambda_seq <- exp(seq(log(lambda_max), log(lambda_max * lambda_min_ratio), length.out = lambda_len))
+  
+  ## CV indices
+  eval_start <- max(selection_start_idx, i - d_periods + 1)
+  eval_idx <- eval_start:i
+  weighted_errors <- rep(0, length(lambda_seq))
+  
+  for (L in seq_along(lambda_seq)) {
+    lam <- lambda_seq[L]
+    err_sum <- 0
+    n_used <- 0
+    
+    theta_lambda <- theta_warm
+    beta_lambda <- beta_warm
+    alpha_lambda <- alpha_warm
+    
+    for (j_idx in eval_idx) {
+      train_end_eval <- max(which(target_ref2 <= origin_ref2[j_idx]))
+      if (!is.finite(train_end_eval) || train_end_eval < 20) next
+      
+      Xtrain_eval <- lapply(Xlag_list, function(M) M[1:train_end_eval, , drop = FALSE])
+      ytrain_eval <- y_vec[1:train_end_eval]
+      
+      fit_j <- joint_fit_nesterov(
+        Xlag_list_train = Xtrain_eval,
+        y_train = ytrain_eval,
+        lambda = lam,
+        theta_init = theta_lambda,
+        beta_init = beta_lambda,
+        alpha_init = alpha_lambda,
+        mu = mu_smooth,
+        maxit = maxit_cv
+      )
+      if (is.null(fit_j) || any(!is.finite(fit_j$beta))) next
+      
+      theta_lambda <- fit_j$theta
+      beta_lambda <- fit_j$beta
+      alpha_lambda <- fit_j$alpha
+      
+      y_pred <- predict_row(Xlag_list, j_idx, fit_j$theta, fit_j$alpha, fit_j$beta)
+      if (!is.finite(y_pred)) next
+      
+      err2 <- (y_vec[j_idx] - y_pred)^2
+      err_sum <- err_sum + delta^(i - j_idx) * err2
+      n_used <- n_used + 1
+    }
+    
+    if (n_used == 0) err_sum <- Inf
+    weighted_errors[L] <- err_sum
+  }
+  
+  lambda_star <- lambda_seq[which.min(weighted_errors)]
+  
+  ## Final fit at lambda*
+  fit_final <- joint_fit_nesterov(
+    Xlag_list_train = Xtrain_main,
+    y_train = ytrain_main,
+    lambda = lambda_star,
+    theta_init = theta_warm,
+    beta_init = beta_warm,
+    alpha_init = alpha_warm,
+    mu = mu_smooth,
+    maxit = maxit_final
   )
   
-  nz <- apply(fit_path$beta, 2, function(b) sum(abs(b) > 0))
-  
-  if (all(nz == 0)) {
-    best_li <- 1
-  } else {
-    cand <- which(nz > 0)
-    best_li <- cand[which.min(abs(nz[cand] - target_nz))]
+  if (is.null(fit_final) || any(!is.finite(fit_final$beta))) {
+    sel_mat_lasso[i, ] <- 0L
+    next
   }
   
-  b_best <- get_beta_at(fit_path, best_li)
+  theta_warm <- fit_final$theta
+  beta_warm <- fit_final$beta
+  alpha_warm <- fit_final$alpha
   
-  for (v in var_names) {
-    cc <- group_cols[[v]]
-    sel_mat[t, v] <- as.integer(any(abs(b_best[cc]) > 0))
+  xi_hat <- as.integer(abs(fit_final$beta) > sel_tol)
+  sel_mat_lasso[i, ] <- xi_hat
+  
+  if (i %% 10 == 0) {
+    cat("t =", i, "/", Tn,
+        "| target:", fmt_yq(target_ref2[i]),
+        "| lambda_max:", signif(lambda_max, 3),
+        "| lambda*:", signif(lambda_star, 3),
+        "| selected:", sum(xi_hat, na.rm = TRUE), "\n")
   }
 }
 
-## ---- 8) Plot heatmap ----
-sel_plot <- sel_mat
-sel_plot[is.na(sel_plot)] <- 0L
+## ============================================================
+## 10A) Heatmap: LASSO-MIDAS selection (2000q1–2012q4)
+## ============================================================
+sel_plot_L <- sel_mat_lasso
+sel_plot_L[is.na(sel_plot_L)] <- 0L
 
-df <- as.data.frame(sel_plot)
-df$ref <- rownames(sel_plot)
+dfL <- as.data.frame(sel_plot_L)
+dfL$ref <- rownames(sel_plot_L)
+dfL_long <- tidyr::pivot_longer(dfL, cols = all_of(var_names),
+                                names_to = "var", values_to = "sel")
+dfL_long$ref_yq   <- zoo::as.yearqtr(dfL_long$ref)
+dfL_long$ref_date <- as.Date(dfL_long$ref_yq, frac = 1)
+dfL_long$var <- factor(dfL_long$var, levels = rev(var_names))
+dfL_long <- dplyr::filter(dfL_long, ref_date >= plot_start_date, ref_date <= plot_end_date)
 
-df_long <- tidyr::pivot_longer(df, cols = all_of(var_names), names_to = "var", values_to = "sel")
-df_long$ref_yq <- zoo::as.yearqtr(df_long$ref)
-
-ggplot(df_long, aes(x = ref_yq, y = var, fill = factor(sel))) +
-  geom_tile(color = "grey80", linewidth = 0.2) +
-  scale_fill_manual(values = c("0" = "white", "1" = "darkgreen"), guide = "none") +
+pL <- ggplot(dfL_long, aes(x = ref_date, y = var, fill = factor(sel))) +
+  geom_tile(color = "grey70", linewidth = 0.15) +
+  scale_fill_manual(values = c("0" = "white", "1" = "#003366"), guide = "none") +
+  scale_x_date(breaks = seq(plot_start_date, plot_end_date, by = "5 years"),
+               labels = function(x) format(zoo::as.yearqtr(x), "%Yq%q")) +
   labs(
-    title = "MIDAS-ML selection (midasml::sglfit) | target: annualized GDP growth (%), h = 6 months",
+    title = "LASSO-MIDAS (Nesterov-smoothed ℓ1) selection (h = 6 months)",
+    subtitle = paste0("μ=", mu_smooth, ", sel_tol=", sel_tol,
+                      ", discounted pseudo-OOS CV (δ=", delta, ", d=", d_periods, ")"),
     x = NULL, y = NULL
   ) +
-  theme_minimal(base_size = 12) +
+  theme_minimal(base_size = 11) +
   theme(
     panel.grid = element_blank(),
-    axis.text.y = element_text(size = 10),
-    axis.text.x = element_text(size = 10)
+    axis.text.y = element_text(size = 9.5, hjust = 1),
+    axis.text.x = element_text(size = 9),
+    plot.title = element_text(size = 13, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.5)
   )
+print(pL)
+
+
+## ============================================================
+## 8b) OCMT helpers
+## ============================================================
+cp_ocmt <- function(n, p = 0.05, delta = 1.1, c_mult = 1.0) {
+  qnorm(1 - p / (2 * c_mult * (n^delta)))
+}
+
+## exp-Almon scalar z and derivatives (single block)
+z_dz_expAlmon <- function(Xj, theta1, theta2) {
+  K <- ncol(Xj)
+  k <- seq_len(K)
+  k2 <- k^2
+  u <- theta1 * k + theta2 * k2
+  u <- u - max(u)
+  ew <- exp(u)
+  w <- ew / sum(ew)
+  
+  Ek  <- sum(w * k)
+  Ek2 <- sum(w * k2)
+  
+  z   <- as.numeric(Xj %*% w)
+  xk  <- as.numeric(Xj %*% (w * k))
+  xk2 <- as.numeric(Xj %*% (w * k2))
+  
+  dz1 <- xk  - Ek  * z
+  dz2 <- xk2 - Ek2 * z
+  
+  list(z = z, dz1 = dz1, dz2 = dz2, w = w)
+}
+
+## Univariate MIDAS fit: y ~ alpha + beta * z_j(theta_j)
+fit_univariate_midas <- function(Xj, y, theta_init = c(-0.05, -0.0001),
+                                 alpha_init = NULL, beta_init = 0,
+                                 maxit = 80) {
+  if (is.null(alpha_init)) alpha_init <- mean(y)
+  
+  pack <- function(alpha, beta, th) c(alpha, beta, th[1], th[2])
+  unpack <- function(par) list(alpha = par[1], beta = par[2], th1 = par[3], th2 = par[4])
+  
+  par0 <- pack(alpha_init, beta_init, theta_init)
+  lower <- c(-Inf, -Inf, theta1_bounds[1], theta2_bounds[1])
+  upper <- c( Inf,  Inf, theta1_bounds[2], theta2_bounds[2])
+  
+  fn_gr <- function(par) {
+    u <- unpack(par)
+    Zd <- z_dz_expAlmon(Xj, u$th1, u$th2)
+    z  <- Zd$z
+    pred <- u$alpha + u$beta * z
+    res  <- y - pred
+    sse  <- sum(res^2)
+    
+    g_alpha <- -2 * sum(res)
+    g_beta  <- -2 * sum(res * z)
+    g_th1   <- -2 * u$beta * sum(res * Zd$dz1)
+    g_th2   <- -2 * u$beta * sum(res * Zd$dz2)
+    
+    list(value = sse, gradient = c(g_alpha, g_beta, g_th1, g_th2))
+  }
+  
+  opt <- tryCatch(
+    optim(par0,
+          fn = function(par) fn_gr(par)$value,
+          gr = function(par) fn_gr(par)$gradient,
+          method = "L-BFGS-B", lower = lower, upper = upper,
+          control = list(maxit = maxit)),
+    error = function(e) NULL
+  )
+  if (is.null(opt) || any(!is.finite(opt$par))) return(NULL)
+  
+  uu <- unpack(opt$par)
+  list(alpha = uu$alpha, beta = uu$beta, theta = c(uu$th1, uu$th2),
+       value = opt$value, convergence = opt$convergence)
+}
+
+## OLS t-stat for a single coefficient (robust to rank issues)
+ols_t_for_col <- function(y, X, j_col) {
+  fit <- tryCatch(qr(X), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  
+  bhat <- tryCatch(qr.coef(fit, y), error = function(e) NULL)
+  if (is.null(bhat) || any(!is.finite(bhat))) return(NA_real_)
+  
+  yhat <- as.numeric(X %*% bhat)
+  res  <- y - yhat
+  
+  df <- nrow(X) - fit$rank
+  if (!is.finite(df) || df <= 1) return(NA_real_)
+  
+  s2 <- sum(res^2) / df
+  
+  R <- qr.R(fit)
+  r <- fit$rank
+  if (r <= 0) return(NA_real_)
+  
+  R1 <- R[1:r, 1:r, drop = FALSE]
+  Rinvt <- tryCatch(solve(t(R1)), error = function(e) NULL)
+  if (is.null(Rinvt)) return(NA_real_)
+  
+  cov_r <- Rinvt %*% t(Rinvt) * s2
+  se <- rep(NA_real_, ncol(X))
+  piv <- fit$pivot[1:r]
+  se[piv] <- sqrt(pmax(diag(cov_r), 0))
+  
+  if (j_col > length(bhat) || is.na(se[j_col]) || se[j_col] == 0) return(NA_real_)
+  bhat[j_col] / se[j_col]
+}
+
+## OCMT selection given Z (T x p)
+ocmt_select <- function(y, Z,
+                        p_nominal = 0.05, delta1 = 1.1, delta2 = 2.1,
+                        c_mult = 1.0, lmax = NULL, max_stages = 50) {
+  
+  Tt <- length(y)
+  p  <- ncol(Z)
+  if (is.null(lmax)) lmax <- min(p, max(1L, floor(Tt * ocmt_lmax_frac)))
+  
+  cp1 <- cp_ocmt(p, p = p_nominal, delta = delta1, c_mult = c_mult)
+  cp2 <- cp_ocmt(p, p = p_nominal, delta = delta2, c_mult = c_mult)
+  
+  selected <- rep(FALSE, p)
+  
+  ## Stage 1: y ~ 1 + Z_j
+  tvals1 <- rep(NA_real_, p)
+  for (j in seq_len(p)) {
+    X <- cbind(1, Z[, j])
+    tvals1[j] <- ols_t_for_col(y, X, j_col = 2)
+  }
+  pick1 <- which(is.finite(tvals1) & abs(tvals1) > cp1)
+  if (length(pick1) > 0) {
+    if (length(pick1) > lmax) {
+      pick1 <- pick1[order(abs(tvals1[pick1]), decreasing = TRUE)][1:lmax]
+    }
+    selected[pick1] <- TRUE
+  }
+  
+  ## Stages >= 2: y ~ 1 + Z_selected + Z_j
+  s <- 2L
+  while (s <= max_stages) {
+    cand <- which(!selected)
+    if (length(cand) == 0) break
+    
+    tvals <- rep(NA_real_, length(cand))
+    for (ii in seq_along(cand)) {
+      j <- cand[ii]
+      X <- cbind(1, Z[, selected, drop = FALSE], Z[, j])
+      tvals[ii] <- ols_t_for_col(y, X, j_col = ncol(X))
+    }
+    
+    new <- cand[which(is.finite(tvals) & abs(tvals) > cp2)]
+    if (length(new) == 0) break
+    
+    remaining <- lmax - sum(selected)
+    if (remaining <= 0) break
+    if (length(new) > remaining) {
+      ord <- order(abs(tvals[match(new, cand)]), decreasing = TRUE)
+      new <- new[ord][1:remaining]
+    }
+    
+    selected[new] <- TRUE
+    s <- s + 1L
+  }
+  
+  list(sel = as.integer(selected), cp1 = cp1, cp2 = cp2)
+}
+
+## ============================================================
+## 9B) OCMT rolling selection loop
+## ============================================================
+sel_mat_ocmt <- matrix(NA_integer_, nrow = Tn, ncol = p)
+colnames(sel_mat_ocmt) <- var_names
+rownames(sel_mat_ocmt) <- as.character(zoo::as.yearqtr(target_ref2))
+
+theta_warm_univ <- cbind(rep(-0.05, p), rep(-0.0001, p))
+rownames(theta_warm_univ) <- var_names
+
+cat("\n=== OCMT selection ===\n")
+cat("Selection shown (targets):", fmt_yq(q_start_selection_target), "to", fmt_yq(max(target_ref2)), "\n")
+cat("OCMT params: p =", ocmt_p_nominal,
+    "| delta1 =", ocmt_delta1, "| delta2 =", ocmt_delta2, "| c =", ocmt_c_mult, "\n\n")
+
+for (i in seq_len(Tn)) {
+  if (is.na(selection_start_idx) || i < selection_start_idx) next
+  
+  train_end_main <- max(which(target_ref2 <= origin_ref2[i]))
+  if (!is.finite(train_end_main) || train_end_main < 30) next
+  
+  Xtrain_main <- lapply(Xlag_list, function(M) M[1:train_end_main, , drop = FALSE])
+  ytrain_main <- y_vec[1:train_end_main]
+  
+  ## Build scalar covariates Z_j(t) via univariate MIDAS fits
+  Z_train <- matrix(NA_real_, nrow = train_end_main, ncol = p)
+  colnames(Z_train) <- var_names
+  
+  for (j in seq_len(p)) {
+    v <- var_names[j]
+    Xj <- Xtrain_main[[v]]
+    
+    fit_j <- fit_univariate_midas(
+      Xj = Xj,
+      y  = ytrain_main,
+      theta_init = theta_warm_univ[j, ],
+      maxit = 60
+    )
+    
+    if (!is.null(fit_j)) {
+      theta_warm_univ[j, ] <- fit_j$theta
+      Zd <- z_dz_expAlmon(Xj, fit_j$theta[1], fit_j$theta[2])
+      Z_train[, j] <- Zd$z
+    } else {
+      th <- theta_warm_univ[j, ]
+      Zd <- z_dz_expAlmon(Xj, th[1], th[2])
+      Z_train[, j] <- Zd$z
+    }
+  }
+  
+  ok <- is.finite(ytrain_main) & complete.cases(Z_train)
+  y_use <- ytrain_main[ok]
+  Z_use <- Z_train[ok, , drop = FALSE]
+  if (length(y_use) < 25) next
+  
+  lmax_here <- min(ncol(Z_use), max(1L, floor(nrow(Z_use) * ocmt_lmax_frac)))
+  
+  out <- ocmt_select(
+    y = y_use, Z = Z_use,
+    p_nominal = ocmt_p_nominal,
+    delta1 = ocmt_delta1, delta2 = ocmt_delta2,
+    c_mult = ocmt_c_mult,
+    lmax = lmax_here,
+    max_stages = ocmt_max_stages
+  )
+  
+  sel_mat_ocmt[i, ] <- out$sel
+  
+  if (i %% 10 == 0) {
+    cat("t =", i, "/", Tn,
+        "| target:", fmt_yq(target_ref2[i]),
+        "| selected:", sum(out$sel, na.rm = TRUE),
+        "| cp1:", signif(out$cp1, 3),
+        "| cp2:", signif(out$cp2, 3), "\n")
+  }
+}
+
+## ============================================================
+## 10B) Heatmap: OCMT selection (2000q1–2012q4)
+## ============================================================
+sel_plot_O <- sel_mat_ocmt
+sel_plot_O[is.na(sel_plot_O)] <- 0L
+
+dfO <- as.data.frame(sel_plot_O)
+dfO$ref <- rownames(sel_plot_O)
+dfO_long <- tidyr::pivot_longer(dfO, cols = all_of(var_names),
+                                names_to = "var", values_to = "sel")
+dfO_long$ref_yq   <- zoo::as.yearqtr(dfO_long$ref)
+dfO_long$ref_date <- as.Date(dfO_long$ref_yq, frac = 1)
+dfO_long$var <- factor(dfO_long$var, levels = rev(var_names))
+dfO_long <- dplyr::filter(dfO_long, ref_date >= plot_start_date, ref_date <= plot_end_date)
+
+pO <- ggplot(dfO_long, aes(x = ref_date, y = var, fill = factor(sel))) +
+  geom_tile(color = "grey70", linewidth = 0.15) +
+  scale_fill_manual(values = c("0" = "white", "1" = "#003366"), guide = "none") +
+  scale_x_date(breaks = seq(plot_start_date, plot_end_date, by = "5 years"),
+               labels = function(x) format(zoo::as.yearqtr(x), "%Yq%q")) +
+  labs(
+    title = "OCMT selection (h = 6 months)",
+    subtitle = paste0("p=", ocmt_p_nominal, ", delta1=", ocmt_delta1,
+                      ", delta2=", ocmt_delta2, ", c=", ocmt_c_mult),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 9.5, hjust = 1),
+    axis.text.x = element_text(size = 9),
+    plot.title = element_text(size = 13, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.5)
+  )
+print(pO)
+
+
+## ============================================================
+## 11) Summary stats (both)
+## ============================================================
+sel_freq_lasso <- colMeans(sel_mat_lasso[selection_start_idx:Tn, , drop = FALSE], na.rm = TRUE)
+sel_freq_ocmt  <- colMeans(sel_mat_ocmt[selection_start_idx:Tn, , drop = FALSE], na.rm = TRUE)
+
+cat("\n=== LASSO-MIDAS Selection Summary (targets from 2000q1) ===\n")
+print(round(sort(sel_freq_lasso, decreasing = TRUE) * 100, 1))
+cat("Average selected per period:",
+    round(mean(rowSums(sel_mat_lasso[selection_start_idx:Tn, , drop = FALSE], na.rm = TRUE)), 2), "\n")
+
+cat("\n=== OCMT Selection Summary (targets from 2000q1) ===\n")
+print(round(sort(sel_freq_ocmt, decreasing = TRUE) * 100, 1))
+cat("Average selected per period:",
+    round(mean(rowSums(sel_mat_ocmt[selection_start_idx:Tn, , drop = FALSE], na.rm = TRUE)), 2), "\n")
+
+
+## Boosting-GLM (Multiple Testing Boosting) knobs
+boost_p_nominal <- 0.05
+boost_delta1    <- 1.10
+boost_delta2    <- 2.10
+boost_link      <- "mean"   # IMPORTANT: y is continuous GDP growth -> use OLS
+boost_maxit     <- 50
+
+
+## ============================================================
+## 8c) Multiple Testing Boosting (GLM/OLS) selection helper
+## ============================================================
+boosting_glm <- function(y,
+                         X,
+                         Xcond = NULL,
+                         pval = 0.05,
+                         delta1 = 1,
+                         delta2 = 1,
+                         link = c("logit", "probit", "mean"),
+                         maxit = 50) {
+  
+  link <- match.arg(link)
+  
+  if (!is.numeric(y)) stop("y must be numeric.")
+  y <- as.numeric(y)
+  
+  if (!is.matrix(X)) X <- as.matrix(X)
+  if (!is.numeric(X)) stop("X must be numeric.")
+  Tn <- nrow(X)
+  N  <- ncol(X)
+  
+  if (length(y) != Tn)
+    stop("length(y) must equal nrow(X).")
+  
+  if (is.null(Xcond)) {
+    Xcond <- matrix(numeric(0), nrow = Tn, ncol = 0)
+  } else {
+    if (!is.matrix(Xcond)) Xcond <- as.matrix(Xcond)
+    if (!is.numeric(Xcond)) stop("Xcond must be numeric.")
+    if (nrow(Xcond) != Tn)
+      stop("nrow(Xcond) must equal nrow(X).")
+  }
+  
+  if (!is.numeric(pval) || length(pval) != 1 || pval <= 0 || pval >= 1)
+    stop("pval must be a scalar in (0,1).")
+  
+  if (!is.numeric(delta1) || length(delta1) != 1 || is.na(delta1))
+    stop("delta1 must be a numeric scalar.")
+  if (!is.numeric(delta2) || length(delta2) != 1 || is.na(delta2))
+    stop("delta2 must be a numeric scalar.")
+  if (delta1 < 1) stop("delta1 must be greater than or equal to 1.")
+  if (delta2 < 1) stop("delta2 must be greater than or equal to 1.")
+  
+  ## thresholds
+  p_val1 <- pval / (N^(delta1 - 1))
+  t_threshold1 <- stats::qnorm(1 - p_val1 / (2 * N))
+  
+  p_val2 <- pval / (N^(delta2 - 1))
+  t_threshold2 <- stats::qnorm(1 - p_val2 / (2 * N))
+  
+  ## helper: abs t/z-stat for first column (candidate)
+  abs_t_first <- function(Xcand, Xsel, Xcond_local) {
+    
+    Xr <- cbind(Xcand, Xsel, Xcond_local)
+    df <- data.frame(y = y, Xr)
+    colnames(df) <- c("y", paste0("V", seq_len(ncol(Xr))))
+    
+    fml <- stats::as.formula(
+      paste0("y ~ ", paste(colnames(df)[-1], collapse = " + "))
+    )
+    
+    if (link %in% c("logit", "probit")) {
+      fam <- if (link == "logit") stats::binomial("logit") else stats::binomial("probit")
+      
+      fit <- tryCatch(
+        stats::glm(fml, data = df, family = fam,
+                   control = stats::glm.control(maxit = maxit)),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(NA_real_)
+      
+      sm <- tryCatch(summary(fit), error = function(e) NULL)
+      if (is.null(sm)) return(NA_real_)
+      if (!("V1" %in% rownames(sm$coefficients))) return(NA_real_)
+      return(abs(sm$coefficients["V1", "z value"]))
+    }
+    
+    ## mean link = OLS
+    fit <- tryCatch(stats::lm(fml, data = df), error = function(e) NULL)
+    if (is.null(fit)) return(NA_real_)
+    
+    sm <- tryCatch(summary(fit), error = function(e) NULL)
+    if (is.null(sm)) return(NA_real_)
+    if (!("V1" %in% rownames(sm$coefficients))) return(NA_real_)
+    abs(sm$coefficients["V1", "t value"])
+  }
+  
+  ## initial stage
+  ind <- rep(FALSE, N)
+  ts  <- numeric(N)
+  
+  for (i in seq_len(N)) {
+    ts[i] <- abs_t_first(X[, i, drop = FALSE], X[, ind, drop = FALSE], Xcond)
+  }
+  
+  max_i <- which.max(ts)
+  if (is.finite(ts[max_i]) && ts[max_i] > t_threshold1)
+    ind[max_i] <- TRUE
+  
+  ## boosting loop
+  repeat {
+    ts <- rep(-Inf, N)
+    
+    for (i in seq_len(N)) {
+      if (!ind[i]) {
+        ts[i] <- abs_t_first(X[, i, drop = FALSE], X[, ind, drop = FALSE], Xcond)
+      }
+    }
+    
+    max_i <- which.max(ts)
+    if (is.finite(ts[max_i]) && ts[max_i] > t_threshold2) {
+      ind[max_i] <- TRUE
+    } else {
+      break
+    }
+  }
+  
+  ind
+}
+
+## ============================================================
+## 9C) Boosting-GLM rolling selection loop
+##      (uses same scalar Z_j construction as OCMT)
+## ============================================================
+sel_mat_boost <- matrix(NA_integer_, nrow = Tn, ncol = p)
+colnames(sel_mat_boost) <- var_names
+rownames(sel_mat_boost) <- as.character(zoo::as.yearqtr(target_ref2))
+
+theta_warm_boost <- cbind(rep(-0.05, p), rep(-0.0001, p))
+rownames(theta_warm_boost) <- var_names
+
+cat("\n=== Multiple Testing Boosting (GLM/OLS) selection ===\n")
+cat("Selection shown (targets):", fmt_yq(q_start_selection_target), "to", fmt_yq(max(target_ref2)), "\n")
+cat("Boosting params: p =", boost_p_nominal,
+    "| delta1 =", boost_delta1, "| delta2 =", boost_delta2,
+    "| link =", boost_link, "\n\n")
+
+for (i in seq_len(Tn)) {
+  if (is.na(selection_start_idx) || i < selection_start_idx) next
+  
+  train_end_main <- max(which(target_ref2 <= origin_ref2[i]))
+  if (!is.finite(train_end_main) || train_end_main < 30) next
+  
+  Xtrain_main <- lapply(Xlag_list, function(M) M[1:train_end_main, , drop = FALSE])
+  ytrain_main <- y_vec[1:train_end_main]
+  
+  ## Build scalar covariates Z_j(t) via univariate MIDAS fits (same as OCMT)
+  Z_train <- matrix(NA_real_, nrow = train_end_main, ncol = p)
+  colnames(Z_train) <- var_names
+  
+  for (j in seq_len(p)) {
+    v <- var_names[j]
+    Xj <- Xtrain_main[[v]]
+    
+    fit_j <- fit_univariate_midas(
+      Xj = Xj,
+      y  = ytrain_main,
+      theta_init = theta_warm_boost[j, ],
+      maxit = 60
+    )
+    
+    if (!is.null(fit_j)) {
+      theta_warm_boost[j, ] <- fit_j$theta
+      Zd <- z_dz_expAlmon(Xj, fit_j$theta[1], fit_j$theta[2])
+      Z_train[, j] <- Zd$z
+    } else {
+      th <- theta_warm_boost[j, ]
+      Zd <- z_dz_expAlmon(Xj, th[1], th[2])
+      Z_train[, j] <- Zd$z
+    }
+  }
+  
+  ok <- is.finite(ytrain_main) & complete.cases(Z_train)
+  y_use <- ytrain_main[ok]
+  Z_use <- Z_train[ok, , drop = FALSE]
+  if (length(y_use) < 25) next
+  
+  ind <- boosting_glm(
+    y = y_use,
+    X = Z_use,
+    Xcond = NULL,
+    pval = boost_p_nominal,
+    delta1 = boost_delta1,
+    delta2 = boost_delta2,
+    link = boost_link,
+    maxit = boost_maxit
+  )
+  
+  sel_mat_boost[i, ] <- as.integer(ind)
+  
+  if (i %% 10 == 0) {
+    cat("t =", i, "/", Tn,
+        "| target:", fmt_yq(target_ref2[i]),
+        "| selected:", sum(ind, na.rm = TRUE), "\n")
+  }
+}
+
+## ============================================================
+## 10C) Heatmap: Boosting-GLM selection (2000q1–2012q4)
+## ============================================================
+sel_plot_B <- sel_mat_boost
+sel_plot_B[is.na(sel_plot_B)] <- 0L
+
+dfB <- as.data.frame(sel_plot_B)
+dfB$ref <- rownames(sel_plot_B)
+dfB_long <- tidyr::pivot_longer(dfB, cols = all_of(var_names),
+                                names_to = "var", values_to = "sel")
+dfB_long$ref_yq   <- zoo::as.yearqtr(dfB_long$ref)
+dfB_long$ref_date <- as.Date(dfB_long$ref_yq, frac = 1)
+dfB_long$var <- factor(dfB_long$var, levels = rev(var_names))
+dfB_long <- dplyr::filter(dfB_long, ref_date >= plot_start_date, ref_date <= plot_end_date)
+
+pB <- ggplot(dfB_long, aes(x = ref_date, y = var, fill = factor(sel))) +
+  geom_tile(color = "grey70", linewidth = 0.15) +
+  scale_fill_manual(values = c("0" = "white", "1" = "#003366"), guide = "none") +
+  scale_x_date(breaks = seq(plot_start_date, plot_end_date, by = "5 years"),
+               labels = function(x) format(zoo::as.yearqtr(x), "%Yq%q")) +
+  labs(
+    title = "Boosting-GLM (Multiple Testing) selection (h = 6 months)",
+    subtitle = paste0("p=", boost_p_nominal, ", delta1=", boost_delta1,
+                      ", delta2=", boost_delta2, ", link=", boost_link),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 9.5, hjust = 1),
+    axis.text.x = element_text(size = 9),
+    plot.title = element_text(size = 13, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.5)
+  )
+print(pB)
+
 
